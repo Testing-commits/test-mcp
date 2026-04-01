@@ -21,8 +21,9 @@
  */
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { z } from "zod";
+import express from "express";
 import { writeFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
@@ -102,8 +103,9 @@ async function hlsPut(path, body = {}) {
 }
 
 // ---------------------------------------------------------------------------
-// MCP Server
+// MCP Server factory — creates a fresh instance per HTTP request
 // ---------------------------------------------------------------------------
+function createServer() {
 const server = new McpServer({ name: "helloleads-crm", version: "2.0.0" });
 
 // ---------------------------------------------------------------------------
@@ -472,10 +474,33 @@ server.tool(
   }
 );
 
-// ---------------------------------------------------------------------------
-// Start the server
-// ---------------------------------------------------------------------------
-const transport = new StdioServerTransport();
-await server.connect(transport);
+  return server;
+}
 
-process.stderr.write("[helloleads-mcp] Server running on stdio transport.\n");
+// ---------------------------------------------------------------------------
+// HTTP server for Railway deployment
+// ---------------------------------------------------------------------------
+const app = express();
+app.use(express.json());
+
+app.get("/health", (_req, res) => {
+  res.json({ status: "ok", service: "helloleads-mcp" });
+});
+
+app.all("/mcp", async (req, res) => {
+  try {
+    const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
+    const mcpServer = createServer();
+    await mcpServer.connect(transport);
+    await transport.handleRequest(req, res, req.body);
+  } catch (err) {
+    if (!res.headersSent) {
+      res.status(500).json({ jsonrpc: "2.0", error: { code: -32603, message: err.message }, id: null });
+    }
+  }
+});
+
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => {
+  process.stderr.write(`[helloleads-mcp] HTTP server listening on port ${PORT}\n`);
+});
