@@ -489,7 +489,7 @@ app.use(express.json());
 app.use((req, res, next) => {
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Accept, Mcp-Session-Id, Cache-Control");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Accept, Mcp-Session-Id, Cache-Control, Authorization");
   if (req.method === "OPTIONS") return res.status(204).end();
   next();
 });
@@ -576,7 +576,7 @@ app.post("/messages", async (req, res) => {
     return res.status(400).json({ error: "Invalid or expired session ID" });
   }
   try {
-    await transport.handlePostMessage(req, res);
+    await transport.handlePostMessage(req, res, req.body);
   } catch (err) {
     if (!res.headersSent) {
       res.status(500).json({ error: err.message });
