@@ -22,6 +22,7 @@
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
+import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
 import { randomUUID } from "node:crypto";
 import { z } from "zod";
 import express from "express";
@@ -488,7 +489,7 @@ app.use(express.json());
 app.use((req, res, next) => {
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Accept, Mcp-Session-Id");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Accept, Mcp-Session-Id, Cache-Control");
   if (req.method === "OPTIONS") return res.status(204).end();
   next();
 });
@@ -545,6 +546,42 @@ app.delete("/mcp", async (req, res) => {
     sessions.delete(sessionId);
   }
   res.status(200).end();
+});
+
+// ---------------------------------------------------------------------------
+// SSE transport — for Convocore and clients using "transport": "sse"
+// GET /sse  → opens the SSE stream; server sends an `endpoint` event
+// POST /messages → client posts JSON-RPC here (sessionId in query string)
+// ---------------------------------------------------------------------------
+const sseTransports = new Map(); // sessionId -> SSEServerTransport
+
+app.get("/sse", async (req, res) => {
+  try {
+    const transport = new SSEServerTransport("/messages", res);
+    sseTransports.set(transport.sessionId, transport);
+    res.on("close", () => sseTransports.delete(transport.sessionId));
+    const mcpServer = createServer();
+    await mcpServer.connect(transport);
+  } catch (err) {
+    if (!res.headersSent) {
+      res.status(500).json({ error: err.message });
+    }
+  }
+});
+
+app.post("/messages", async (req, res) => {
+  const sessionId = req.query.sessionId;
+  const transport = sseTransports.get(sessionId);
+  if (!transport) {
+    return res.status(400).json({ error: "Invalid or expired session ID" });
+  }
+  try {
+    await transport.handlePostMessage(req, res);
+  } catch (err) {
+    if (!res.headersSent) {
+      res.status(500).json({ error: err.message });
+    }
+  }
 });
 
 const PORT = process.env.PORT || 3000;
