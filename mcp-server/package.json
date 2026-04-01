@@ -1,0 +1,19 @@
+{
+  "name": "helloleads-mcp-server",
+  "version": "1.0.0",
+  "description": "MCP Server for HelloLeads CRM — exposes leads, lists, and user data as AI-accessible tools",
+  "type": "module",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "node --watch src/index.js"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.10.2",
+    "dotenv": "^16.4.5",
+    "zod": "^3.23.8"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
