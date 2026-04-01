@@ -22,6 +22,7 @@
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
+import { randomUUID } from "node:crypto";
 import { z } from "zod";
 import express from "express";
 import { writeFileSync } from "node:fs";
@@ -483,21 +484,67 @@ server.tool(
 const app = express();
 app.use(express.json());
 
+// CORS — required for web-based MCP clients (Convocore, etc.)
+app.use((req, res, next) => {
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Accept, Mcp-Session-Id");
+  if (req.method === "OPTIONS") return res.status(204).end();
+  next();
+});
+
 app.get("/health", (_req, res) => {
   res.json({ status: "ok", service: "helloleads-mcp" });
 });
 
-app.all("/mcp", async (req, res) => {
+// ---------------------------------------------------------------------------
+// Stateful MCP sessions — keeps initialize + tools/list in the same session
+// ---------------------------------------------------------------------------
+const sessions = new Map(); // sessionId -> StreamableHTTPServerTransport
+
+app.post("/mcp", async (req, res) => {
   try {
-    const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
-    const mcpServer = createServer();
-    await mcpServer.connect(transport);
+    const sessionId = req.headers["mcp-session-id"];
+    let transport = sessionId ? sessions.get(sessionId) : null;
+
+    if (!transport) {
+      // New session: create server + transport together
+      transport = new StreamableHTTPServerTransport({
+        sessionIdGenerator: () => randomUUID(),
+        onsessioninitialized: (id) => {
+          sessions.set(id, transport);
+        },
+      });
+      const mcpServer = createServer();
+      await mcpServer.connect(transport);
+    }
+
     await transport.handleRequest(req, res, req.body);
   } catch (err) {
     if (!res.headersSent) {
       res.status(500).json({ jsonrpc: "2.0", error: { code: -32603, message: err.message }, id: null });
     }
   }
+});
+
+// GET /mcp — SSE streaming for server-sent notifications
+app.get("/mcp", async (req, res) => {
+  const sessionId = req.headers["mcp-session-id"];
+  const transport = sessionId ? sessions.get(sessionId) : null;
+  if (!transport) {
+    return res.status(400).json({ error: "No active session. POST to /mcp first." });
+  }
+  await transport.handleRequest(req, res);
+});
+
+// DELETE /mcp — client-initiated session termination
+app.delete("/mcp", async (req, res) => {
+  const sessionId = req.headers["mcp-session-id"];
+  if (sessionId && sessions.has(sessionId)) {
+    try { await sessions.get(sessionId).close(); } catch { /* ignore */ }
+    sessions.delete(sessionId);
+  }
+  res.status(200).end();
 });
 
 const PORT = process.env.PORT || 3000;
