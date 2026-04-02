@@ -26,7 +26,6 @@ import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
 import { randomUUID } from "node:crypto";
 import { z } from "zod";
 import express from "express";
-import { writeFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 
@@ -48,6 +47,13 @@ try {
 let HLS_BASE_URL = (process.env.HLS_BASE_URL ?? "").replace(/\/$/, "");
 let HLS_API_KEY  = process.env.HLS_API_KEY  ?? "";
 let HLS_EMAIL    = process.env.HLS_EMAIL    ?? "";
+
+if (!HLS_BASE_URL || !HLS_API_KEY || !HLS_EMAIL) {
+  process.stderr.write(
+    "[helloleads-mcp] WARNING: HLS_BASE_URL, HLS_API_KEY, and HLS_EMAIL must be set " +
+    "as environment variables in Railway (Service → Variables).\n"
+  );
+}
 
 function missingCredsMessage() {
   if (!HLS_BASE_URL || !HLS_API_KEY || !HLS_EMAIL) {
@@ -109,60 +115,6 @@ async function hlsPut(path, body = {}) {
 // ---------------------------------------------------------------------------
 function createServer() {
 const server = new McpServer({ name: "helloleads-crm", version: "2.0.0" });
-
-// ---------------------------------------------------------------------------
-// configure_credentials
-// ---------------------------------------------------------------------------
-server.tool(
-  "configure_credentials",
-  "Set your HelloLeads API credentials. Call this first before using any other tool. " +
-  "Credentials are saved to a local .env file so you only need to do this once.",
-  {
-    baseUrl: z.string().url().describe(
-      "Base URL of your HelloLeads app, e.g. https://app.helloleads.io (no trailing slash)."
-    ),
-    apiKey: z.string().min(1).describe(
-      "Your HelloLeads API key. Find it under Settings -> API in the HelloLeads web app."
-    ),
-    email: z.string().email().describe(
-      "Email address of the HelloLeads account owner / API user."
-    ),
-  },
-  async ({ baseUrl, apiKey, email }) => {
-    HLS_BASE_URL = baseUrl.replace(/\/$/, "");
-    HLS_API_KEY  = apiKey;
-    HLS_EMAIL    = email;
-
-    const envPath = join(__dirname, "..", ".env");
-    const lines = [
-      `HLS_BASE_URL=${HLS_BASE_URL}`,
-      `HLS_API_KEY=${HLS_API_KEY}`,
-      `HLS_EMAIL=${HLS_EMAIL}`,
-    ];
-    try {
-      writeFileSync(envPath, lines.join("\n") + "\n", "utf8");
-    } catch (writeErr) {
-      return {
-        content: [{
-          type: "text",
-          text:
-            "Credentials accepted and active for this session, but could not be saved " +
-            `to disk (${writeErr.message}). You will need to configure again after a restart.`,
-        }],
-      };
-    }
-    return {
-      content: [{
-        type: "text",
-        text:
-          `HelloLeads credentials saved successfully.\n` +
-          `  Base URL : ${HLS_BASE_URL}\n` +
-          `  Email    : ${HLS_EMAIL}\n\n` +
-          `You can now use all HelloLeads tools.`,
-      }],
-    };
-  }
-);
 
 // ---------------------------------------------------------------------------
 // get_lists  —  GET /index.php/private/api/lists
@@ -505,16 +457,24 @@ const sessions = new Map(); // sessionId -> StreamableHTTPServerTransport
 
 app.post("/mcp", async (req, res) => {
   try {
+    // SSE message post: sessionId in query string (from SSEServerTransport endpoint event)
+    if (req.query.sessionId) {
+      const sseTransport = sseTransports.get(req.query.sessionId);
+      if (!sseTransport) {
+        return res.status(400).json({ error: "Invalid or expired SSE session" });
+      }
+      await sseTransport.handlePostMessage(req, res, req.body);
+      return;
+    }
+
+    // Streamable HTTP session
     const sessionId = req.headers["mcp-session-id"];
     let transport = sessionId ? sessions.get(sessionId) : null;
 
     if (!transport) {
-      // New session: create server + transport together
       transport = new StreamableHTTPServerTransport({
         sessionIdGenerator: () => randomUUID(),
-        onsessioninitialized: (id) => {
-          sessions.set(id, transport);
-        },
+        onsessioninitialized: (id) => { sessions.set(id, transport); },
       });
       const mcpServer = createServer();
       await mcpServer.connect(transport);
@@ -528,9 +488,25 @@ app.post("/mcp", async (req, res) => {
   }
 });
 
-// GET /mcp — SSE streaming for server-sent notifications
+// GET /mcp — new SSE session (Convocore / legacy SSE clients) OR existing Streamable HTTP session
 app.get("/mcp", async (req, res) => {
   const sessionId = req.headers["mcp-session-id"];
+
+  // No session ID + SSE accept header → open a new legacy SSE session (Convocore)
+  if (!sessionId && req.headers.accept?.includes("text/event-stream")) {
+    try {
+      const transport = new SSEServerTransport("/mcp", res);
+      sseTransports.set(transport.sessionId, transport);
+      res.on("close", () => sseTransports.delete(transport.sessionId));
+      const mcpServer = createServer();
+      await mcpServer.connect(transport);
+    } catch (err) {
+      if (!res.headersSent) res.status(500).json({ error: err.message });
+    }
+    return;
+  }
+
+  // Existing Streamable HTTP session
   const transport = sessionId ? sessions.get(sessionId) : null;
   if (!transport) {
     return res.status(400).json({ error: "No active session. POST to /mcp first." });
