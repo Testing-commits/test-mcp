@@ -10,10 +10,11 @@
  */
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { z } from "zod";
 import fs from "fs";
 import path from "path";
+import http from "http";
 
 // ─── Config ─────────────────────────────────────────────────────────────────
 const BASE_URL = (process.env.HLS_BASE_URL || "https://dev.helloleads.io").replace(/\/$/, "");
@@ -766,14 +767,35 @@ server.tool(
   }
 );
 
-// ─── Start ───────────────────────────────────────────────────────────────────
-async function main() {
-  const transport = new StdioServerTransport();
-  await server.connect(transport);
-  console.error("HLS MCP Server running on stdio");
-}
+// ─── Start HTTP Server ────────────────────────────────────────────────────────
+const PORT = process.env.PORT || 3000;
 
-main().catch((err) => {
-  console.error("Fatal error starting HLS MCP Server:", err);
-  process.exit(1);
+const httpServer = http.createServer(async (req, res) => {
+  // Health check endpoint
+  if (req.method === "GET" && req.url === "/") {
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ status: "ok", name: "hls-mcp-server" }));
+    return;
+  }
+
+  // MCP endpoint
+  if (req.url === "/mcp") {
+    const transport = new StreamableHTTPServerTransport({
+      sessionIdGenerator: undefined, // stateless mode
+    });
+
+    res.on("close", () => transport.close());
+
+    await server.connect(transport);
+    await transport.handleRequest(req, res);
+    return;
+  }
+
+  res.writeHead(404, { "Content-Type": "application/json" });
+  res.end(JSON.stringify({ error: "Not found" }));
+});
+
+httpServer.listen(PORT, () => {
+  console.error(`HLS MCP Server listening on port ${PORT}`);
+  console.error(`MCP endpoint: http://0.0.0.0:${PORT}/mcp`);
 });
