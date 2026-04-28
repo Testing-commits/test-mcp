@@ -11,10 +11,11 @@
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
+import { randomUUID } from "crypto";
 import { z } from "zod";
 import fs from "fs";
 import path from "path";
-import http from "http";
+import express from "express";
 
 // ─── Config ─────────────────────────────────────────────────────────────────
 const BASE_URL = (process.env.HLS_BASE_URL || "https://dev.helloleads.io").replace(/\/$/, "");
@@ -60,12 +61,8 @@ function log_message(tool, params) {
   fs.appendFileSync(LOG_FILE, logEntry);
 }
 
-// ─── Server ──────────────────────────────────────────────────────────────────
-const server = new McpServer({
-  name: "hls-mcp-server",
-  version: "1.0.0",
-  description: "MCP Server for HLS CRM APIs",
-});
+// ─── Tool Registration ────────────────────────────────────────────────────────
+function registerTools(server) {
 
 // ════════════════════════════════════════════════════════════════════════════
 // AUTH
@@ -767,35 +764,76 @@ server.tool(
   }
 );
 
+} // end registerTools
+
 // ─── Start HTTP Server ────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;
+const app = express();
+app.use(express.json());
 
-const httpServer = http.createServer(async (req, res) => {
-  // Health check endpoint
-  if (req.method === "GET" && req.url === "/") {
-    res.writeHead(200, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({ status: "ok", name: "hls-mcp-server" }));
-    return;
-  }
+// Session store: sessionId -> { transport, server }
+const sessions = new Map();
 
-  // MCP endpoint
-  if (req.url === "/mcp") {
-    const transport = new StreamableHTTPServerTransport({
-      sessionIdGenerator: undefined, // stateless mode
-    });
-
-    res.on("close", () => transport.close());
-
-    await server.connect(transport);
-    await transport.handleRequest(req, res);
-    return;
-  }
-
-  res.writeHead(404, { "Content-Type": "application/json" });
-  res.end(JSON.stringify({ error: "Not found" }));
+// Health check
+app.get("/", (req, res) => {
+  res.json({ status: "ok", name: "hls-mcp-server", endpoint: "/mcp" });
 });
 
-httpServer.listen(PORT, () => {
+// MCP endpoint — Streamable HTTP (POST to init, GET for SSE stream, DELETE to close)
+app.all("/mcp", async (req, res) => {
+  try {
+    const sessionId = req.headers["mcp-session-id"];
+
+    // ── Existing session: route request to its transport ──
+    if (sessionId && sessions.has(sessionId)) {
+      const { transport } = sessions.get(sessionId);
+      await transport.handleRequest(req, res);
+      return;
+    }
+
+    // ── No session ID on a non-POST = bad request ──
+    if (req.method !== "POST") {
+      res.status(400).json({ error: "New sessions must be initialized with a POST request." });
+      return;
+    }
+
+    // ── New session ──
+    const sessionServer = new McpServer({
+      name: "hls-mcp-server",
+      version: "1.0.0",
+      description: "MCP Server for HLS CRM APIs",
+    });
+    registerTools(sessionServer);
+
+    const transport = new StreamableHTTPServerTransport({
+      sessionIdGenerator: () => randomUUID(),
+      onsessioninitialized: (id) => {
+        // Now transport is fully constructed — safe to store
+        sessions.set(id, { transport, server: sessionServer });
+        console.error(`Session opened: ${id} (total: ${sessions.size})`);
+      },
+    });
+
+    transport.onclose = () => {
+      const id = transport.sessionId;
+      if (id && sessions.has(id)) {
+        sessions.delete(id);
+        console.error(`Session closed: ${id} (total: ${sessions.size})`);
+      }
+    };
+
+    await sessionServer.connect(transport);
+    await transport.handleRequest(req, res);
+
+  } catch (err) {
+    console.error("MCP handler error:", err);
+    if (!res.headersSent) {
+      res.status(500).json({ error: "Internal server error", detail: err.message });
+    }
+  }
+});
+
+app.listen(PORT, "0.0.0.0", () => {
   console.error(`HLS MCP Server listening on port ${PORT}`);
   console.error(`MCP endpoint: http://0.0.0.0:${PORT}/mcp`);
 });
