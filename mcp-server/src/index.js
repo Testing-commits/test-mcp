@@ -769,7 +769,11 @@ server.tool(
 // ─── Start HTTP Server ────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;
 const app = express();
-app.use(express.json());
+
+// NOTE: Do NOT apply express.json() globally.
+// StreamableHTTPServerTransport reads the raw request body itself.
+// Pre-parsing it with express.json() consumes the stream and causes:
+// "Parse error: Invalid JSON" (jsonrpc error -32700)
 
 // Session store: sessionId -> { transport, server }
 const sessions = new Map();
