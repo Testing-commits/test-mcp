@@ -1,18 +1,17 @@
 {
-  "name": "helloleads-mcp-server",
+  "name": "hls-mcp-server",
   "version": "1.0.0",
-  "description": "MCP Server for HelloLeads CRM — exposes leads, lists, and user data as AI-accessible tools",
+  "description": "MCP Server for HLS CRM — HTTP+SSE transport for ChatGPT and Claude",
   "type": "module",
-  "main": "src/index.js",
+  "main": "index.js",
   "scripts": {
-    "start": "node src/index.js",
-    "dev": "node --watch src/index.js"
+    "start": "node index.js",
+    "dev":   "node --watch index.js"
   },
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.10.2",
-    "dotenv": "^16.4.5",
-    "express": "^5.0.0",
-    "zod": "^3.23.8"
+    "@modelcontextprotocol/sdk": "^1.0.0",
+    "dotenv":                    "^16.4.0",
+    "zod":                       "^3.23.0"
   },
   "engines": {
     "node": ">=18.0.0"
