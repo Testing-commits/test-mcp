@@ -847,6 +847,18 @@ function createMcpServer(authContext = null) {
 
 const sessions = new Map(); // sessionId → SSEServerTransport
 
+function getRequestBaseUrl(req) {
+  const forwardedProto = req.headers["x-forwarded-proto"];
+  const proto = forwardedProto ? forwardedProto.split(",")[0].trim() :
+                (req.connection && req.connection.encrypted ? "https" : "http");
+  const host = req.headers["host"] || `localhost:${PORT}`;
+  return `${proto}://${host}`;
+}
+
+function getResourceMetadataUrl(req) {
+  return `${getRequestBaseUrl(req)}/.well-known/oauth-protected-resource`;
+}
+
 async function requestHandler(req, res) {
   const protocol = USE_HTTPS ? "https" : "http";
   const url = new URL(req.url, `${protocol}://localhost:${PORT}`);
@@ -867,6 +879,17 @@ async function requestHandler(req, res) {
   if (req.method === "OPTIONS") {
     res.writeHead(204);
     res.end();
+    return;
+  }
+
+  // ── Resource metadata ── GET /.well-known/oauth-protected-resource ─────────
+  if (req.method === "GET" && url.pathname === "/.well-known/oauth-protected-resource") {
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({
+      resource: `${getRequestBaseUrl(req)}/mcp`,
+      authorization_servers: [`${BASE_URL}/api/mcp/v1/oauth`],
+      scopes_supported: ["leads", "todos", "org", "reports"],
+    }));
     return;
   }
 
@@ -905,7 +928,9 @@ async function requestHandler(req, res) {
         authContext = await validateOAuthToken(token);
         
         if (!authContext) {
+          const resourceMetadata = getResourceMetadataUrl(req);
           console.error(`[SSE] Invalid OAuth token`);
+          res.setHeader("WWW-Authenticate", `Bearer realm="mcp", resource_metadata="${resourceMetadata}"`);
           res.writeHead(401, { "Content-Type": "application/json" });
           res.end(JSON.stringify({ error: "Invalid or expired OAuth token" }));
           return;
@@ -913,7 +938,9 @@ async function requestHandler(req, res) {
         
         console.error(`[SSE] Authenticated session for user: ${authContext.userName} (${authContext.userId})`);
       } else {
+        const resourceMetadata = getResourceMetadataUrl(req);
         console.error(`[SSE] Missing Authorization header (OAuth required)`);
+        res.setHeader("WWW-Authenticate", `Bearer realm="mcp", resource_metadata="${resourceMetadata}"`);
         res.writeHead(401, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ error: "Authorization required" }));
         return;
