@@ -842,10 +842,11 @@ async function requestHandler(req, res) {
 
   // ── Message endpoint ── POST /mcp/messages ────────────────────────────────
   if (req.method === "POST" && url.pathname === "/mcp/messages") {
-    const sessionId = req.headers["mcp-session-id"];
+    const sessionId = url.searchParams.get("sessionId") || req.headers["mcp-session-id"];
     const transport = sessions.get(sessionId);
 
     if (!transport) {
+      console.error(`[MCP] Message POST failed; sessionId=${sessionId || "none"} not found`);
       res.writeHead(404, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ error: "Session not found" }));
       return;
