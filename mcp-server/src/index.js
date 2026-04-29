@@ -43,56 +43,99 @@ const HTTPS_PFX_PATH = process.env.HTTPS_PFX_PATH || "";
 const HTTPS_PASSPHRASE = process.env.HTTPS_PASSPHRASE || "";
 const OAUTH_ENABLED  = process.env.OAUTH_ENABLED === "1" || process.env.OAUTH_ENABLED === "true";
 
-// ─── OAuth Session Cache ─────────────────────────────────────────────────────
-// Cache validated OAuth tokens for 5 minutes to avoid repeated lookups
-const oauthCache = new Map(); // token → { userId, sessionId, expiresAt }
+// ─── Token cache + validation ───────────────────────────────────────────────
+const tokenCache = new Map(); // token → { userId, sessionId, expiry, ... }
 const CACHE_TTL = 5 * 60 * 1000; // 5 minutes
 
-async function validateOAuthToken(token) {
-  // Check cache first
-  const cached = oauthCache.get(token);
-  if (cached && cached.cacheExpiry > Date.now()) {
-    console.error(`[OAuth] Using cached session for token (userId: ${cached.userId})`);
+function extractToken(req) {
+  const authHeader = req.headers["authorization"];
+  if (!authHeader || !authHeader.startsWith("Bearer ")) return null;
+  return authHeader.substring(7).trim();
+}
+
+async function validateBearerToken(token) {
+  if (!token) return null;
+
+  const cached = tokenCache.get(token);
+  if (cached && cached.expiry > Date.now()) {
+    console.error(`[Auth] Using cached token session for userId=${cached.userId}`);
     return cached;
   }
 
-  // Validate with backend
   try {
-    const response = await fetch(`${BASE_URL}/api/mcp/v1/oauth/validate`, {
-      headers: {
-        'Authorization': `Bearer ${token}`,
-        'Content-Type': 'application/json',
-      }
+    let response = await fetch(`${BASE_URL}/api/mcp/validateToken`, {
+      headers: { token },
     });
 
+    if (response.status === 404) {
+      response = await fetch(`${BASE_URL}/api/mcp/v1/oauth/validate`, {
+        headers: {
+          Authorization: `Bearer ${token}`,
+          "Content-Type": "application/json",
+        },
+      });
+    }
+
     if (!response.ok) {
-      const error = await response.json();
-      console.error(`[OAuth] Token validation failed: ${JSON.stringify(error)}`);
+      const error = await response.text();
+      console.error(`[Auth] Token validation failed: ${response.status} ${error}`);
       return null;
     }
 
-    const session = await response.json();
-    
-    // Cache the result
-    const cacheEntry = {
-      userId: session.userId,
-      sessionId: session.sessionId,
-      emailId: session.emailId,
-      userName: session.userName,
-      orgId: session.orgId,
-      orgName: session.orgName,
-      cacheExpiry: Date.now() + CACHE_TTL,
-      tokenExpiry: new Date(session.expires_at).getTime(),
+    const data = await response.json();
+    const session = {
+      userId:    data.userId,
+      sessionId: token,
+      orgId:     data.orgId,
+      emailId:   data.emailId,
+      userName:  data.userName,
+      orgName:   data.orgName,
+      expiry:    Date.now() + CACHE_TTL,
     };
-    oauthCache.set(token, cacheEntry);
-    
-    console.error(`[OAuth] Token validated successfully (userId: ${session.userId}, expires: ${session.expires_at})`);
-    return cacheEntry;
-  } catch (error) {
-    console.error(`[OAuth] Validation error: ${error.message}`);
+    tokenCache.set(token, session);
+    return session;
+  } catch (err) {
+    console.error(`[Auth] Token validation error: ${err.message}`);
     return null;
   }
 }
+
+const rateLimitStore = new Map();
+const RATE_LIMIT_WINDOW = 60 * 1000; // 1 minute
+const RATE_LIMIT_MAX = 100; // max requests per window
+
+function checkRateLimit(sessionId, max = RATE_LIMIT_MAX, window = RATE_LIMIT_WINDOW) {
+  if (!sessionId) throw new Error("Missing sessionId for rate limiting");
+  const now = Date.now();
+  const entry = rateLimitStore.get(sessionId) || { count: 0, windowStart: now };
+
+  if (now - entry.windowStart > window) {
+    entry.count = 0;
+    entry.windowStart = now;
+  }
+
+  entry.count += 1;
+  rateLimitStore.set(sessionId, entry);
+
+  if (entry.count > max) {
+    throw new Error("Rate limit exceeded");
+  }
+}
+
+setInterval(() => {
+  const now = Date.now();
+  for (const [token, session] of tokenCache.entries()) {
+    if (session.expiry < now) {
+      tokenCache.delete(token);
+    }
+  }
+
+  for (const [sessionId, entry] of rateLimitStore.entries()) {
+    if (now - entry.windowStart > RATE_LIMIT_WINDOW) {
+      rateLimitStore.delete(sessionId);
+    }
+  }
+}, 60000);
 
 // ─── Logging Helper (async) ──────────────────────────────────────────────────
 const LOG_FILE = path.join(__dirname, "mcp_server.log");
@@ -919,32 +962,26 @@ async function requestHandler(req, res) {
   if (req.method === "GET" && url.pathname === "/mcp/sse") {
     console.error(`[SSE] New session from ${origin || "unknown"}`);
 
-    // Extract OAuth token from Authorization header (if OAuth is enabled)
+    const token = extractToken(req);
     let authContext = null;
-    if (OAUTH_ENABLED) {
-      const authHeader = req.headers["authorization"];
-      if (authHeader && authHeader.startsWith("Bearer ")) {
-        const token = authHeader.substring(7);
-        authContext = await validateOAuthToken(token);
-        
-        if (!authContext) {
-          const resourceMetadata = getResourceMetadataUrl(req);
-          console.error(`[SSE] Invalid OAuth token`);
-          res.setHeader("WWW-Authenticate", `Bearer realm="mcp", resource_metadata="${resourceMetadata}"`);
-          res.writeHead(401, { "Content-Type": "application/json" });
-          res.end(JSON.stringify({ error: "Invalid or expired OAuth token" }));
-          return;
-        }
-        
-        console.error(`[SSE] Authenticated session for user: ${authContext.userName} (${authContext.userId})`);
-      } else {
-        const resourceMetadata = getResourceMetadataUrl(req);
-        console.error(`[SSE] Missing Authorization header (OAuth required)`);
-        res.setHeader("WWW-Authenticate", `Bearer realm="mcp", resource_metadata="${resourceMetadata}"`);
+
+    if (token) {
+      authContext = await validateBearerToken(token);
+      if (!authContext) {
+        console.error(`[SSE] Invalid Bearer token`);
         res.writeHead(401, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ error: "Authorization required" }));
+        res.end(JSON.stringify({ error: "Invalid token" }));
         return;
       }
+      console.error(`[SSE] Authenticated session for user: ${authContext.userId}`);
+    } else if (!OAUTH_ENABLED && AUTH_TOKEN && USER_ID) {
+      authContext = { userId: USER_ID, sessionId: AUTH_TOKEN };
+      console.error(`[SSE] Fallback session using env credentials userId=${USER_ID}`);
+    } else {
+      console.error(`[SSE] Missing Bearer token`);
+      res.writeHead(401, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "Missing Bearer token" }));
+      return;
     }
 
     const mcpServer = createMcpServer(authContext);
@@ -971,6 +1008,15 @@ async function requestHandler(req, res) {
       console.error(`[MCP] Message POST failed; sessionId=${sessionId || "none"} not found`);
       res.writeHead(404, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ error: "Session not found" }));
+      return;
+    }
+
+    try {
+      checkRateLimit(sessionId);
+    } catch (err) {
+      console.error(`[MCP] Rate limit exceeded for sessionId=${sessionId}`);
+      res.writeHead(429, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "rate_limit_exceeded" }));
       return;
     }
 
