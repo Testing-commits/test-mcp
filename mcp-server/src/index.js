@@ -24,6 +24,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
 import { z } from "zod";
 import http from "http";
+import https from "https";
 import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
@@ -32,10 +33,15 @@ import "dotenv/config";
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 // ─── Config ─────────────────────────────────────────────────────────────────
-const BASE_URL  = (process.env.HLS_BASE_URL || "https://dev.helloleads.io").replace(/\/$/, "");
-const AUTH_TOKEN = process.env.HLS_TOKEN   || "";
-const USER_ID    = process.env.HLS_USER_ID || "";
-const PORT       = parseInt(process.env.PORT || "3000");
+const BASE_URL       = (process.env.HLS_BASE_URL || "https://dev.helloleads.io").replace(/\/$/, "");
+const AUTH_TOKEN     = process.env.HLS_TOKEN   || "";
+const USER_ID        = process.env.HLS_USER_ID || "";
+const PORT           = parseInt(process.env.PORT || "3000");
+const USE_HTTPS      = process.env.USE_HTTPS === "1" || process.env.USE_HTTPS === "true";
+const HTTPS_KEY_PATH = process.env.HTTPS_KEY_PATH || "";
+const HTTPS_CERT_PATH= process.env.HTTPS_CERT_PATH || "";
+const HTTPS_PFX_PATH = process.env.HTTPS_PFX_PATH || "";
+const HTTPS_PASSPHRASE = process.env.HTTPS_PASSPHRASE || "";
 
 // ─── Logging Helper (async) ──────────────────────────────────────────────────
 const LOG_FILE = path.join(__dirname, "mcp_server.log");
@@ -775,13 +781,14 @@ function createMcpServer() {
   return server;
 }
 
-// ─── HTTP + SSE Transport ────────────────────────────────────────────────────
+// ─── HTTP/HTTPS + SSE Transport ────────────────────────────────────────────
 // One SSE session per connected user. Sessions are tracked by session ID.
 
 const sessions = new Map(); // sessionId → SSEServerTransport
 
-const httpServer = http.createServer(async (req, res) => {
-  const url = new URL(req.url, `http://localhost:${PORT}`);
+async function requestHandler(req, res) {
+  const protocol = USE_HTTPS ? "https" : "http";
+  const url = new URL(req.url, `${protocol}://localhost:${PORT}`);
 
   // ── CORS ──────────────────────────────────────────────────────────────────
   const allowedOrigins = [
@@ -851,12 +858,32 @@ const httpServer = http.createServer(async (req, res) => {
   // ── 404 ───────────────────────────────────────────────────────────────────
   res.writeHead(404, { "Content-Type": "application/json" });
   res.end(JSON.stringify({ error: "Not found" }));
-});
+}
 
-httpServer.listen(PORT, () => {
+const useHttpsServer = USE_HTTPS || HTTPS_PFX_PATH || (HTTPS_KEY_PATH && HTTPS_CERT_PATH);
+const serverOptions = useHttpsServer ? {} : null;
+if (useHttpsServer) {
+  if (HTTPS_PFX_PATH) {
+    serverOptions.pfx = fs.readFileSync(HTTPS_PFX_PATH);
+  } else {
+    serverOptions.key = fs.readFileSync(HTTPS_KEY_PATH);
+    serverOptions.cert = fs.readFileSync(HTTPS_CERT_PATH);
+  }
+  if (HTTPS_PASSPHRASE) {
+    serverOptions.passphrase = HTTPS_PASSPHRASE;
+  }
+}
+
+const server = useHttpsServer
+  ? https.createServer(serverOptions, requestHandler)
+  : http.createServer(requestHandler);
+
+const actualProtocol = useHttpsServer ? "https" : "http";
+
+server.listen(PORT, () => {
   console.error(`HLS MCP Server running on port ${PORT}`);
-  console.error(`SSE:      http://localhost:${PORT}/mcp/sse`);
-  console.error(`Messages: http://localhost:${PORT}/mcp/messages`);
-  console.error(`Health:   http://localhost:${PORT}/mcp`);
+  console.error(`SSE:      ${actualProtocol}://localhost:${PORT}/mcp/sse`);
+  console.error(`Messages: ${actualProtocol}://localhost:${PORT}/mcp/messages`);
+  console.error(`Health:   ${actualProtocol}://localhost:${PORT}/mcp`);
   console.error(`Auth:     Xemail=${USER_ID ? "set" : "MISSING"} Auth=${AUTH_TOKEN ? "set" : "MISSING"}`);
 });
