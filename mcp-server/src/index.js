@@ -42,6 +42,58 @@ const HTTPS_KEY_PATH = process.env.HTTPS_KEY_PATH || "";
 const HTTPS_CERT_PATH= process.env.HTTPS_CERT_PATH || "";
 const HTTPS_PFX_PATH = process.env.HTTPS_PFX_PATH || "";
 const HTTPS_PASSPHRASE = process.env.HTTPS_PASSPHRASE || "";
+const OAUTH_ENABLED  = process.env.OAUTH_ENABLED === "1" || process.env.OAUTH_ENABLED === "true";
+
+// ─── OAuth Session Cache ─────────────────────────────────────────────────────
+// Cache validated OAuth tokens for 5 minutes to avoid repeated lookups
+const oauthCache = new Map(); // token → { userId, sessionId, expiresAt }
+const CACHE_TTL = 5 * 60 * 1000; // 5 minutes
+
+async function validateOAuthToken(token) {
+  // Check cache first
+  const cached = oauthCache.get(token);
+  if (cached && cached.cacheExpiry > Date.now()) {
+    console.error(`[OAuth] Using cached session for token (userId: ${cached.userId})`);
+    return cached;
+  }
+
+  // Validate with backend
+  try {
+    const response = await fetch(`${BASE_URL}/api/mcp/v1/oauth/validate`, {
+      headers: {
+        'Authorization': `Bearer ${token}`,
+        'Content-Type': 'application/json',
+      }
+    });
+
+    if (!response.ok) {
+      const error = await response.json();
+      console.error(`[OAuth] Token validation failed: ${JSON.stringify(error)}`);
+      return null;
+    }
+
+    const session = await response.json();
+    
+    // Cache the result
+    const cacheEntry = {
+      userId: session.userId,
+      sessionId: session.sessionId,
+      emailId: session.emailId,
+      userName: session.userName,
+      orgId: session.orgId,
+      orgName: session.orgName,
+      cacheExpiry: Date.now() + CACHE_TTL,
+      tokenExpiry: new Date(session.expires_at).getTime(),
+    };
+    oauthCache.set(token, cacheEntry);
+    
+    console.error(`[OAuth] Token validated successfully (userId: ${session.userId}, expires: ${session.expires_at})`);
+    return cacheEntry;
+  } catch (error) {
+    console.error(`[OAuth] Validation error: ${error.message}`);
+    return null;
+  }
+}
 
 // ─── Logging Helper (async) ──────────────────────────────────────────────────
 const LOG_FILE = path.join(__dirname, "mcp_server.log");
@@ -52,7 +104,8 @@ function log_message(tool, params) {
 
 // ─── HTTP Helper ─────────────────────────────────────────────────────────────
 // All 32 HLS APIs receive the same Xemail + Auth headers — unchanged.
-async function hlsRequest({ method, path: apiPath, query = {}, body = null }) {
+// Now supports per-request OAuth credentials via authContext parameter.
+async function hlsRequest({ method, path: apiPath, query = {}, body = null, authContext = null }) {
   const url = new URL(`${BASE_URL}${apiPath}`);
 
   Object.entries(query).forEach(([k, v]) => {
@@ -67,9 +120,14 @@ async function hlsRequest({ method, path: apiPath, query = {}, body = null }) {
     ApiClient:      "MCP",
   };
 
-  // ← your existing HLS auth headers — unchanged
-  if (AUTH_TOKEN) headers["Auth"]   = AUTH_TOKEN;
-  if (USER_ID)    headers["Xemail"] = USER_ID;
+  // Use OAuth context if provided, otherwise fall back to env vars
+  if (authContext) {
+    headers["Auth"]   = authContext.sessionId;
+    headers["Xemail"] = authContext.userId;
+  } else {
+    if (AUTH_TOKEN) headers["Auth"]   = AUTH_TOKEN;
+    if (USER_ID)    headers["Xemail"] = USER_ID;
+  }
 
   const opts = { method, headers };
   if (body) opts.body = JSON.stringify(body);
@@ -85,12 +143,16 @@ async function hlsRequest({ method, path: apiPath, query = {}, body = null }) {
 
 // ─── MCP Server factory ──────────────────────────────────────────────────────
 // Called once per SSE session — returns a fully-configured McpServer instance.
-function createMcpServer() {
+// OAuth authContext is passed to all tool handlers for per-user authentication.
+function createMcpServer(authContext = null) {
   const server = new McpServer({
     name:        "hls-mcp-server",
     version:     "1.0.0",
     description: "MCP Server for HLS CRM APIs",
   });
+
+  // Helper to inject authContext into all hlsRequest calls
+  const authedHlsRequest = (params) => hlsRequest({ ...params, authContext });
 
   // ══════════════════════════════════════════════════════════════════════════
   // LEADS
@@ -106,7 +168,7 @@ function createMcpServer() {
     async (params) => {
       log_message("get_leads_summary", params);
       const { organizationId, visitorId } = params;
-      const data = await hlsRequest({
+      const data = await authedHlsRequest({
         method: "GET",
         path:   "/api/mcp/v1/leads/leadSummary",
         query:  { organizationId, visitorId },
@@ -153,7 +215,7 @@ function createMcpServer() {
     },
     async (params) => {
       log_message("get_leads", params);
-      const data = await hlsRequest({ method: "GET", path: "/api/mcp/v1/leads/leads", query: params });
+      const data = await authedHlsRequest({ method: "GET", path: "/api/mcp/v1/leads/leads", query: params });
       return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
     }
   );
@@ -175,7 +237,7 @@ function createMcpServer() {
     },
     async (params) => {
       log_message("get_unattended_leads", params);
-      const data = await hlsRequest({
+      const data = await authedHlsRequest({
         method: "GET",
         path:   "/index.php/api/mcp/v1/leads/unattendedLeads",
         query:  params,
@@ -207,7 +269,7 @@ function createMcpServer() {
       if (email)     body.email     = email;
       if (phone)     body.phone     = phone;
       if (notes)     body.notes     = notes;
-      const data = await hlsRequest({
+      const data = await authedHlsRequest({
         method: "POST",
         path:   "/api/mcp/v1/leads/leadCreate",
         query:  { organizationId, visitorId },
@@ -229,7 +291,7 @@ function createMcpServer() {
     async (params) => {
       log_message("create_lead_comment", params);
       const { lead_id, org_id, comment, comment_userId } = params;
-      const data = await hlsRequest({
+      const data = await authedHlsRequest({
         method: "POST",
         path:   "/api/mcp/v1/leads/leadCommentCreate",
         body: {
@@ -261,7 +323,7 @@ function createMcpServer() {
       if (lastName)  body.lastName  = lastName;
       if (email)     body.email     = email;
       if (phone)     body.phone     = phone;
-      const data = await hlsRequest({ method: "PUT", path: "/api/mcp/v1/leads/profile", body });
+      const data = await authedHlsRequest({ method: "PUT", path: "/api/mcp/v1/leads/profile", body });
       return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
     }
   );
@@ -279,7 +341,7 @@ function createMcpServer() {
       customerGroupId: z.number().optional().describe("Customer group ID"),
     },
     async ({ visitorId, organizationId, ...rest }) => {
-      const data = await hlsRequest({
+      const data = await authedHlsRequest({
         method: "PUT",
         path:   "/api/mcp/v1/leads/qualifiers",
         body:   { visitorId, organizationId, ...rest },
@@ -298,7 +360,7 @@ function createMcpServer() {
       followupNote:   z.string().optional().describe("Note for the follow-up"),
     },
     async ({ visitorId, organizationId, followupDate, followupNote }) => {
-      const data = await hlsRequest({
+      const data = await authedHlsRequest({
         method: "PUT",
         path:   "/api/mcp/v1/leads/followup",
         body:   { visitorId, organizationId, followupDate, followupNote },
@@ -316,7 +378,7 @@ function createMcpServer() {
       fields:         z.record(z.unknown()).describe("Key-value map of Info Plus fields to update"),
     },
     async ({ visitorId, organizationId, fields }) => {
-      const data = await hlsRequest({
+      const data = await authedHlsRequest({
         method: "PUT",
         path:   "/api/mcp/v1/leads/infoPlus",
         body:   { visitorId, organizationId, ...fields },
@@ -334,7 +396,7 @@ function createMcpServer() {
     "Get organization details.",
     { organizationId: z.string().describe("Organization ID") },
     async ({ organizationId }) => {
-      const data = await hlsRequest({
+      const data = await authedHlsRequest({
         method: "GET",
         path:   "/index.php/api/mcp/v1/org",
         query:  { organizationId },
@@ -348,7 +410,7 @@ function createMcpServer() {
     "List all product groups for an organization.",
     { organizationId: z.string().describe("Organization ID") },
     async ({ organizationId }) => {
-      const data = await hlsRequest({
+      const data = await authedHlsRequest({
         method: "GET",
         path:   "/api/mcp/v1/org/productGroups",
         query:  { organizationId },
@@ -362,7 +424,7 @@ function createMcpServer() {
     "List all customer groups for an organization.",
     { organizationId: z.string().describe("Organization ID") },
     async ({ organizationId }) => {
-      const data = await hlsRequest({
+      const data = await authedHlsRequest({
         method: "GET",
         path:   "/api/mcp/v1/org/customerGroups",
         query:  { organizationId },
@@ -376,7 +438,7 @@ function createMcpServer() {
     "List all tags for an organization.",
     { organizationId: z.string().describe("Organization ID") },
     async ({ organizationId }) => {
-      const data = await hlsRequest({
+      const data = await authedHlsRequest({
         method: "GET",
         path:   "/api/mcp/v1/org/tags",
         query:  { organizationId },
@@ -390,7 +452,7 @@ function createMcpServer() {
     "List all custom fields defined for an organization.",
     { organizationId: z.string().describe("Organization ID") },
     async ({ organizationId }) => {
-      const data = await hlsRequest({
+      const data = await authedHlsRequest({
         method: "GET",
         path:   "/api/mcp/v1/org/customFields",
         query:  { organizationId },
@@ -404,7 +466,7 @@ function createMcpServer() {
     "List all lead stages for an organization.",
     { organizationId: z.string().describe("Organization ID") },
     async ({ organizationId }) => {
-      const data = await hlsRequest({
+      const data = await authedHlsRequest({
         method: "GET",
         path:   "/api/mcp/v1/org/leadStages",
         query:  { organizationId },
@@ -426,7 +488,7 @@ function createMcpServer() {
       stageId:        z.number().describe("Target stage ID"),
     },
     async ({ organizationId, visitorIds, stageId }) => {
-      const data = await hlsRequest({
+      const data = await authedHlsRequest({
         method: "PUT",
         path:   "/api/mcp/v1/BulkQualifier/updateLeadStage",
         query:  { organizationId },
@@ -445,7 +507,7 @@ function createMcpServer() {
       potential:      z.enum(["High", "Medium", "Low"]).describe("Potential value"),
     },
     async ({ organizationId, visitorIds, potential }) => {
-      const data = await hlsRequest({
+      const data = await authedHlsRequest({
         method: "PUT",
         path:   "/api/mcp/v1/BulkQualifier/updatePotential",
         query:  { organizationId },
@@ -464,7 +526,7 @@ function createMcpServer() {
       categoryId:     z.number().describe("Customer group / category ID"),
     },
     async ({ organizationId, visitorIds, categoryId }) => {
-      const data = await hlsRequest({
+      const data = await authedHlsRequest({
         method: "PUT",
         path:   "/api/mcp/v1/BulkQualifier/updateCustomerGroup",
         query:  { organizationId },
@@ -485,7 +547,7 @@ function createMcpServer() {
       updateMode:     z.enum(["append", "replace"]).default("append").describe("append or replace existing groups"),
     },
     async ({ organizationId, visitorIds, services, updateMode }) => {
-      const data = await hlsRequest({
+      const data = await authedHlsRequest({
         method: "PUT",
         path:   "/api/mcp/v1/BulkQualifier/updateProductGroups",
         query:  { organizationId },
@@ -507,7 +569,7 @@ function createMcpServer() {
       updateMode:     z.enum(["append", "replace"]).default("append").describe("append or replace existing tags"),
     },
     async ({ organizationId, userId, visitorIds, tags, updateMode }) => {
-      const data = await hlsRequest({
+      const data = await authedHlsRequest({
         method: "PUT",
         path:   "/api/mcp/v1/BulkQualifier/updateTags",
         query:  { organizationId },
@@ -535,7 +597,7 @@ function createMcpServer() {
       dontFollow:     z.string().optional().default("0").describe("0 = follow, 1 = don't follow"),
     },
     async ({ organizationId, visitorIds, assignTo, assignBy, assignedAt, dontFollow }) => {
-      const data = await hlsRequest({
+      const data = await authedHlsRequest({
         method: "PUT",
         path:   "/api/mcp/v1/BulkQualifier/bulkAssign",
         query:  { organizationId },
@@ -566,7 +628,7 @@ function createMcpServer() {
       visitorId:      z.string().describe("Visitor / lead ID"),
     },
     async ({ organizationId, visitorId }) => {
-      const data = await hlsRequest({
+      const data = await authedHlsRequest({
         method: "GET",
         path:   "/index.php/api/mcp/v1/todo/todo/todo",
         query:  { organizationId, visitorId },
@@ -604,7 +666,7 @@ function createMcpServer() {
         ...extraFields,
       };
       if (title) body.title = title;
-      const data = await hlsRequest({
+      const data = await authedHlsRequest({
         method: "POST",
         path:   "/index.php/api/mcp/v1/todo/todo/todo",
         body,
@@ -631,7 +693,7 @@ function createMcpServer() {
       if (dueDateTime !== undefined)  body.dueDateTime = dueDateTime;
       if (critical    !== undefined)  body.critical    = critical;
       if (donePercent !== undefined)  body.donePercent = donePercent;
-      const data = await hlsRequest({
+      const data = await authedHlsRequest({
         method: "PUT",
         path:   "/index.php/api/mcp/v1/todo/todo/todo",
         query:  { id, organizationId, assignedTo },
@@ -653,7 +715,7 @@ function createMcpServer() {
       user_id: z.string().optional().describe("Specific user ID to fetch"),
     },
     async ({ org_id, user_id }) => {
-      const data = await hlsRequest({
+      const data = await authedHlsRequest({
         method: "GET",
         path:   "/api/mcp/v1/users/users",
         query:  { org_id, user_id },
@@ -675,7 +737,7 @@ function createMcpServer() {
       extraFields: z.record(z.unknown()).optional().describe("Additional user fields"),
     },
     async ({ org_id, firstName, lastName, email, phone, roleId, extraFields }) => {
-      const data = await hlsRequest({
+      const data = await authedHlsRequest({
         method: "POST",
         path:   "/api/mcp/v1/users/users",
         query:  { org_id },
@@ -698,7 +760,7 @@ function createMcpServer() {
       extraFields: z.record(z.unknown()).optional().describe("Additional fields to update"),
     },
     async ({ org_id, userId, firstName, lastName, email, phone, extraFields }) => {
-      const data = await hlsRequest({
+      const data = await authedHlsRequest({
         method: "PUT",
         path:   "/api/mcp/v1/users/users",
         body:   { org_id, userId, firstName, lastName, email, phone, ...extraFields },
@@ -723,7 +785,7 @@ function createMcpServer() {
     "Get sales performance report for team members over a date range.",
     reportSchema,
     async ({ organizationId, userIds, currentStartDate, currentEndDate }) => {
-      const data = await hlsRequest({
+      const data = await authedHlsRequest({
         method: "POST",
         path:   "/api/mcp/v1/teamreport/salesPerformance",
         query:  { organizationId },
@@ -738,7 +800,7 @@ function createMcpServer() {
     "Get lead management activity report for team members.",
     reportSchema,
     async ({ organizationId, userIds, currentStartDate, currentEndDate }) => {
-      const data = await hlsRequest({
+      const data = await authedHlsRequest({
         method: "POST",
         path:   "/api/mcp/v1/teamreport/leadManagementActivity",
         query:  { organizationId },
@@ -753,7 +815,7 @@ function createMcpServer() {
     "Get customer communication report for team members.",
     reportSchema,
     async ({ organizationId, userIds, currentStartDate, currentEndDate }) => {
-      const data = await hlsRequest({
+      const data = await authedHlsRequest({
         method: "POST",
         path:   "/api/mcp/v1/teamreport/customerCommunication",
         query:  { organizationId },
@@ -768,7 +830,7 @@ function createMcpServer() {
     "Get activity metrics report for team members.",
     reportSchema,
     async ({ organizationId, userIds, currentStartDate, currentEndDate }) => {
-      const data = await hlsRequest({
+      const data = await authedHlsRequest({
         method: "POST",
         path:   "/api/mcp/v1/teamreport/activityMetrics",
         query:  { organizationId },
@@ -812,11 +874,21 @@ async function requestHandler(req, res) {
   // ── Health check / manifest ── GET /mcp ───────────────────────────────────
   if (req.method === "GET" && url.pathname === "/mcp") {
     res.writeHead(200, { "Content-Type": "application/json" });
+    
+    const authConfig = OAUTH_ENABLED ? {
+      type: "oauth2",
+      oauth2: {
+        authorizationUrl: `${BASE_URL}/api/mcp/v1/oauth/authorize`,
+        tokenUrl: `${BASE_URL}/api/mcp/v1/oauth/token`,
+        scope: "leads todos org reports",
+      }
+    } : { type: "none" };
+    
     res.end(JSON.stringify({
       name:        "HLS CRM",
       version:     "1.0.0",
       description: "MCP server for HLS CRM — manage leads, todos, users and reports",
-      auth:        { type: "none" }, // ← change to "oauth2" when OAuth layer is added
+      auth:        authConfig,
     }));
     return;
   }
@@ -825,10 +897,34 @@ async function requestHandler(req, res) {
   if (req.method === "GET" && url.pathname === "/mcp/sse") {
     console.error(`[SSE] New session from ${origin || "unknown"}`);
 
-    const mcpServer = createMcpServer();
+    // Extract OAuth token from Authorization header (if OAuth is enabled)
+    let authContext = null;
+    if (OAUTH_ENABLED) {
+      const authHeader = req.headers["authorization"];
+      if (authHeader && authHeader.startsWith("Bearer ")) {
+        const token = authHeader.substring(7);
+        authContext = await validateOAuthToken(token);
+        
+        if (!authContext) {
+          console.error(`[SSE] Invalid OAuth token`);
+          res.writeHead(401, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "Invalid or expired OAuth token" }));
+          return;
+        }
+        
+        console.error(`[SSE] Authenticated session for user: ${authContext.userName} (${authContext.userId})`);
+      } else {
+        console.error(`[SSE] Missing Authorization header (OAuth required)`);
+        res.writeHead(401, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "Authorization required" }));
+        return;
+      }
+    }
+
+    const mcpServer = createMcpServer(authContext);
     const transport = new SSEServerTransport("/mcp/messages", res);
 
-    sessions.set(transport.sessionId, transport);
+    sessions.set(transport.sessionId, { transport, authContext });
     console.error(`[SSE] Session started: ${transport.sessionId}`);
 
     res.on("close", () => {
@@ -843,16 +939,16 @@ async function requestHandler(req, res) {
   // ── Message endpoint ── POST /mcp/messages ────────────────────────────────
   if (req.method === "POST" && url.pathname === "/mcp/messages") {
     const sessionId = url.searchParams.get("sessionId") || req.headers["mcp-session-id"];
-    const transport = sessions.get(sessionId);
+    const session = sessions.get(sessionId);
 
-    if (!transport) {
+    if (!session) {
       console.error(`[MCP] Message POST failed; sessionId=${sessionId || "none"} not found`);
       res.writeHead(404, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ error: "Session not found" }));
       return;
     }
 
-    await transport.handlePostMessage(req, res);
+    await session.transport.handlePostMessage(req, res);
     return;
   }
 
@@ -888,3 +984,4 @@ server.listen(PORT, () => {
   console.error(`Health:   ${actualProtocol}://localhost:${PORT}/mcp`);
   console.error(`Auth:     Xemail=${USER_ID ? "set" : "MISSING"} Auth=${AUTH_TOKEN ? "set" : "MISSING"}`);
 });
+
