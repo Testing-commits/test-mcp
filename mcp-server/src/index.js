@@ -1,4 +1,3 @@
-#!/usr/bin/env node
 /**
  * HLS MCP Server — synced for ChatGPT + Claude
  *
