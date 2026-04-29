@@ -936,6 +936,15 @@ async function requestHandler(req, res) {
     return;
   }
 
+  // ── Redirect root authorize requests to the HLS backend auth server ─────────
+  if (req.method === "GET" && url.pathname === "/authorize") {
+    const target = new URL(`${BASE_URL}/api/mcp/v1/oauth/authorize`);
+    url.searchParams.forEach((value, name) => target.searchParams.append(name, value));
+    res.writeHead(302, { Location: target.toString() });
+    res.end();
+    return;
+  }
+
   // ── Health check / manifest ── GET /mcp ───────────────────────────────────
   if (req.method === "GET" && url.pathname === "/mcp") {
     res.writeHead(200, { "Content-Type": "application/json" });
@@ -968,7 +977,9 @@ async function requestHandler(req, res) {
     if (token) {
       authContext = await validateBearerToken(token);
       if (!authContext) {
+        const resourceMetadata = getResourceMetadataUrl(req);
         console.error(`[SSE] Invalid Bearer token`);
+        res.setHeader("WWW-Authenticate", `Bearer realm="mcp", resource_metadata="${resourceMetadata}"`);
         res.writeHead(401, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ error: "Invalid token" }));
         return;
@@ -978,7 +989,9 @@ async function requestHandler(req, res) {
       authContext = { userId: USER_ID, sessionId: AUTH_TOKEN };
       console.error(`[SSE] Fallback session using env credentials userId=${USER_ID}`);
     } else {
+      const resourceMetadata = getResourceMetadataUrl(req);
       console.error(`[SSE] Missing Bearer token`);
+      res.setHeader("WWW-Authenticate", `Bearer realm="mcp", resource_metadata="${resourceMetadata}"`);
       res.writeHead(401, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ error: "Missing Bearer token" }));
       return;
