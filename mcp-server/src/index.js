@@ -936,6 +936,25 @@ async function requestHandler(req, res) {
     return;
   }
 
+  // ── OAuth discovery — GET /.well-known/oauth-authorization-server or openid config ─
+  if (req.method === "GET" && (
+      url.pathname === "/.well-known/oauth-authorization-server" ||
+      url.pathname === "/.well-known/openid-configuration"
+  )) {
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({
+      issuer: `${getRequestBaseUrl(req)}`,
+      authorization_endpoint: `${BASE_URL}/api/mcp/v1/oauth/authorize`,
+      token_endpoint: `${BASE_URL}/api/mcp/v1/oauth/token`,
+      response_types_supported: ["code"],
+      grant_types_supported: ["authorization_code"],
+      code_challenge_methods_supported: ["S256"],
+      token_endpoint_auth_methods_supported: ["client_secret_post"],
+      scopes_supported: ["leads", "todos", "org", "reports"],
+    }));
+    return;
+  }
+
   // ── Redirect root authorize requests to the HLS backend auth server ─────────
   if (req.method === "GET" && url.pathname === "/authorize") {
     const target = new URL(`${BASE_URL}/api/mcp/v1/oauth/authorize`);
