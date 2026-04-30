@@ -1,9 +1,10 @@
 {
-  "issuer": "https://dev.helloleads.io",
+  "issuer": "https://test-mcp-production-b287.up.railway.app",
   "authorization_endpoint": "https://dev.helloleads.io/api/mcp/v1/oauth/authorize",
   "token_endpoint": "https://dev.helloleads.io/api/mcp/v1/oauth/token",
   "response_types_supported": ["code"],
   "grant_types_supported": ["authorization_code"],
   "code_challenge_methods_supported": ["S256"],
+  "token_endpoint_auth_methods_supported": ["client_secret_post"],
   "scopes_supported": ["leads", "todos", "org", "reports"]
 }
