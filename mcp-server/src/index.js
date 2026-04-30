@@ -930,7 +930,7 @@ async function requestHandler(req, res) {
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end(JSON.stringify({
       resource: `${getRequestBaseUrl(req)}/mcp`,
-      authorization_servers: [`${BASE_URL}/api/mcp/v1/oauth`],
+      authorization_servers: [`${getRequestBaseUrl(req)}`],  // ← Must be THIS Node.js server, not PHP backend
       scopes_supported: ["leads", "todos", "org", "reports"],
     }));
     return;
