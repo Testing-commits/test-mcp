@@ -62,40 +62,53 @@ async function validateBearerToken(token) {
     return cached;
   }
 
+  // Validate directly against the PHP OAuth validate endpoint
+  const validateUrl = `${BASE_URL}/api/mcp/v1/oauth/validate`;
+  console.error(`[Auth] Validating token against: ${validateUrl}`);
+
   try {
-    let response = await fetch(`${BASE_URL}/api/mcp/validateToken`, {
-      headers: { token },
+    const response = await fetch(validateUrl, {
+      method: "GET",
+      headers: {
+        Authorization: `Bearer ${token}`,
+        "Content-Type": "application/json",
+        Accept:         "application/json",
+      },
     });
 
-    if (response.status === 404) {
-      response = await fetch(`${BASE_URL}/api/mcp/v1/oauth/validate`, {
-        headers: {
-          Authorization: `Bearer ${token}`,
-          "Content-Type": "application/json",
-        },
-      });
-    }
-
-    if (!response.ok) {
-      const error = await response.text();
-      console.error(`[Auth] Token validation failed: ${response.status} ${error}`);
+    let data;
+    const text = await response.text();
+    try {
+      data = JSON.parse(text);
+    } catch {
+      console.error(`[Auth] Validate endpoint returned non-JSON (status ${response.status}): ${text.slice(0, 200)}`);
       return null;
     }
 
-    const data = await response.json();
+    if (!response.ok) {
+      console.error(`[Auth] Token validation failed (${response.status}):`, data);
+      return null;
+    }
+
+    if (!data.valid || !data.userId) {
+      console.error(`[Auth] Token validation returned unexpected payload:`, data);
+      return null;
+    }
+
     const session = {
       userId:    data.userId,
-      sessionId: token,
+      sessionId: data.sessionId,   // actual HLS session token, not the OAuth token
       orgId:     data.orgId,
       emailId:   data.emailId,
       userName:  data.userName,
       orgName:   data.orgName,
       expiry:    Date.now() + CACHE_TTL,
     };
+    console.error(`[Auth] Token validated: userId=${session.userId}, orgId=${session.orgId}`);
     tokenCache.set(token, session);
     return session;
   } catch (err) {
-    console.error(`[Auth] Token validation error: ${err.message}`);
+    console.error(`[Auth] Token validation network error: ${err.message}`);
     return null;
   }
 }
@@ -929,8 +942,8 @@ async function requestHandler(req, res) {
   if (req.method === "GET" && url.pathname === "/.well-known/oauth-protected-resource") {
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end(JSON.stringify({
-      resource: `${getRequestBaseUrl(req)}/mcp`,
-      authorization_servers: [`${getRequestBaseUrl(req)}`],  // ← Must be THIS Node.js server, not PHP backend
+      resource: `${getRequestBaseUrl(req)}/mcp/sse`,             // ← actual SSE endpoint Claude connects to
+      authorization_servers: [`${getRequestBaseUrl(req)}`],      // ← discovery is on THIS Node.js server
       scopes_supported: ["leads", "todos", "org", "reports"],
     }));
     return;
