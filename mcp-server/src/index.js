@@ -28,6 +28,7 @@ import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
 import "dotenv/config";
+import crypto from "crypto";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -42,6 +43,17 @@ const HTTPS_CERT_PATH= process.env.HTTPS_CERT_PATH || "";
 const HTTPS_PFX_PATH = process.env.HTTPS_PFX_PATH || "";
 const HTTPS_PASSPHRASE = process.env.HTTPS_PASSPHRASE || "";
 const OAUTH_ENABLED  = process.env.OAUTH_ENABLED === "1" || process.env.OAUTH_ENABLED === "true";
+
+// ─── Internal PHP client secrets (server-side only; never exposed to end users) ─────
+const INTERNAL_CLIENT_SECRETS = {
+  claude:  process.env.CLAUDE_CLIENT_SECRET  || "5ThiOnEfGKu31coR8sAvMDHZadI9z2jxrNwlVFBWkb0p6etYqSm4JgCPQXLy7U",
+  chatgpt: process.env.CHATGPT_CLIENT_SECRET || "your_chatgpt_secret_here",
+  google:  process.env.GOOGLE_CLIENT_SECRET  || "your_google_secret_here",
+};
+
+// ─── Dynamic client registry (RFC 7591) ──────────────────────────────────────
+// Clients auto-register on first connect and re-register transparently after a server restart.
+const dynamicClients = new Map(); // dynamic_client_id → { clientSecret, redirectUris, clientName }
 
 // ─── Token cache + validation ───────────────────────────────────────────────
 const tokenCache = new Map(); // token → { userId, sessionId, expiry, ... }
@@ -917,6 +929,42 @@ function createMcpServer(authContext = null) {
   return server;
 }
 
+// ─── OAuth Proxy Helpers ─────────────────────────────────────────────────────
+
+/** Read the full HTTP request body as a string. */
+function readBody(req) {
+  return new Promise((resolve, reject) => {
+    let body = "";
+    req.on("data", chunk => { body += chunk.toString(); });
+    req.on("end", () => resolve(body));
+    req.on("error", reject);
+  });
+}
+
+/** Parse application/x-www-form-urlencoded into a plain object. */
+function parseFormBody(str) {
+  const result = {};
+  for (const pair of (str || "").split("&").filter(Boolean)) {
+    const idx = pair.indexOf("=");
+    const k = decodeURIComponent(idx >= 0 ? pair.slice(0, idx)  : pair);
+    const v = decodeURIComponent(idx >= 0 ? pair.slice(idx + 1) : "");
+    result[k] = v;
+  }
+  return result;
+}
+
+/**
+ * Map an OAuth redirect_uri to the corresponding internal PHP client_id.
+ * Internal client credentials are never visible to end users.
+ */
+function getPhpClientId(redirectUri) {
+  if (!redirectUri) return "claude";
+  if (redirectUri.includes("claude.ai"))   return "claude";
+  if (redirectUri.includes("chatgpt.com") || redirectUri.includes("openai.com")) return "chatgpt";
+  if (redirectUri.includes("gemini.google.com") || redirectUri.includes("aistudio.google.com") || redirectUri.includes("makersuite.google.com")) return "google";
+  return "claude"; // safe default
+}
+
 // ─── HTTP/HTTPS + SSE Transport ────────────────────────────────────────────
 // One SSE session per connected user. Sessions are tracked by session ID.
 
@@ -978,24 +1026,135 @@ async function requestHandler(req, res) {
   )) {
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end(JSON.stringify({
-      issuer: `${getRequestBaseUrl(req)}`,
-      authorization_endpoint: `${BASE_URL}/api/mcp/v1/oauth/authorize`,
-      token_endpoint: `${BASE_URL}/api/mcp/v1/oauth/token`,
-      response_types_supported: ["code"],
-      grant_types_supported: ["authorization_code"],
-      code_challenge_methods_supported: ["S256"],
-      token_endpoint_auth_methods_supported: ["client_secret_post"],
-      scopes_supported: ["leads", "todos", "org", "reports"],
+      issuer:                                 `${getRequestBaseUrl(req)}`,
+      // All OAuth endpoints served by THIS Node.js server (internal PHP credentials never exposed)
+      authorization_endpoint:                 `${getRequestBaseUrl(req)}/authorize`,
+      token_endpoint:                         `${getRequestBaseUrl(req)}/token`,
+      registration_endpoint:                  `${getRequestBaseUrl(req)}/register`,
+      response_types_supported:               ["code"],
+      grant_types_supported:                  ["authorization_code"],
+      code_challenge_methods_supported:       ["S256"],
+      token_endpoint_auth_methods_supported:  ["client_secret_post"],
+      scopes_supported:                       ["leads", "todos", "org", "reports"],
     }));
     return;
   }
 
-  // ── Redirect root authorize requests to the HLS backend auth server ─────────
+  // ── Dynamic Client Registration — POST /register  (RFC 7591) ────────────────
+  // Claude/ChatGPT call this automatically; user never needs to supply credentials.
+  if (req.method === "POST" && url.pathname === "/register") {
+    const bodyStr = await readBody(req);
+    let meta = {};
+    try { meta = JSON.parse(bodyStr || "{}"); } catch { /* ignore parse errors */ }
+
+    const clientId     = "mcp_" + crypto.randomBytes(12).toString("hex");
+    const clientSecret = crypto.randomBytes(24).toString("base64url");
+
+    dynamicClients.set(clientId, {
+      clientSecret,
+      redirectUris: meta.redirect_uris || [],
+      clientName:   meta.client_name   || "Unknown Client",
+      registeredAt: Date.now(),
+    });
+
+    console.error(`[OAuth] Dynamic client registered: ${clientId} name="${meta.client_name || "?"}" redirects=${JSON.stringify(meta.redirect_uris || [])}`);
+
+    res.writeHead(201, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({
+      client_id:                  clientId,
+      client_secret:              clientSecret,
+      client_id_issued_at:        Math.floor(Date.now() / 1000),
+      client_secret_expires_at:   0,          // never expires
+      redirect_uris:              meta.redirect_uris || [],
+      grant_types:                ["authorization_code"],
+      response_types:             ["code"],
+      token_endpoint_auth_method: "client_secret_post",
+      client_name:                meta.client_name || "Unknown Client",
+    }));
+    return;
+  }
+
+  // ── Authorization — GET /authorize ───────────────────────────────────────────
+  // Validates the dynamic client, then proxies to PHP using the internal (hidden) client_id.
   if (req.method === "GET" && url.pathname === "/authorize") {
-    const target = new URL(`${BASE_URL}/api/mcp/v1/oauth/authorize`);
-    url.searchParams.forEach((value, name) => target.searchParams.append(name, value));
-    res.writeHead(302, { Location: target.toString() });
+    const dynClientId  = url.searchParams.get("client_id")     || "";
+    const redirectUri  = url.searchParams.get("redirect_uri")  || "";
+    const state        = url.searchParams.get("state")         || "";
+    const responseType = url.searchParams.get("response_type") || "code";
+
+    const client = dynamicClients.get(dynClientId);
+    if (!client) {
+      console.error(`[OAuth] /authorize - unknown dynamic client_id: "${dynClientId}"`);
+      res.writeHead(400, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "invalid_client", error_description: "Unknown client — please reconnect to re-register." }));
+      return;
+    }
+
+    const validRedirect = redirectUri && client.redirectUris.some(u => redirectUri.startsWith(u));
+    if (!validRedirect) {
+      console.error(`[OAuth] /authorize - redirect_uri not in registered list: ${redirectUri}`);
+      res.writeHead(400, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "invalid_redirect_uri" }));
+      return;
+    }
+
+    // Proxy to PHP with the internal (hidden) client_id
+    const phpClientId = getPhpClientId(redirectUri);
+    const phpUrl      = new URL(`${BASE_URL}/api/mcp/v1/oauth/authorize`);
+    phpUrl.searchParams.set("client_id",     phpClientId);
+    phpUrl.searchParams.set("redirect_uri",  redirectUri);
+    phpUrl.searchParams.set("state",         state);
+    phpUrl.searchParams.set("response_type", responseType);
+    const cc = url.searchParams.get("code_challenge");
+    if (cc) {
+      phpUrl.searchParams.set("code_challenge",        cc);
+      phpUrl.searchParams.set("code_challenge_method", url.searchParams.get("code_challenge_method") || "S256");
+    }
+    console.error(`[OAuth] /authorize → PHP client=${phpClientId}`);
+    res.writeHead(302, { Location: phpUrl.toString() });
     res.end();
+    return;
+  }
+
+  // ── Token Exchange — POST /token ─────────────────────────────────────────────
+  // Validates the dynamic client, then proxies to PHP with the internal secret.
+  if (req.method === "POST" && url.pathname === "/token") {
+    const bodyStr = await readBody(req);
+    const params  = parseFormBody(bodyStr);
+    const { client_id: dynClientId, client_secret: dynSecret, code, grant_type, redirect_uri } = params;
+
+    const client = dynamicClients.get(dynClientId);
+    if (!client || !dynSecret || client.clientSecret !== dynSecret) {
+      console.error(`[OAuth] /token - invalid dynamic client: "${dynClientId}"`);
+      res.writeHead(401, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "invalid_client" }));
+      return;
+    }
+
+    const phpClientId     = getPhpClientId(redirect_uri);
+    const phpClientSecret = INTERNAL_CLIENT_SECRETS[phpClientId] || INTERNAL_CLIENT_SECRETS.claude;
+    console.error(`[OAuth] /token → PHP client=${phpClientId}`);
+    try {
+      const phpResp = await fetch(`${BASE_URL}/api/mcp/v1/oauth/token`, {
+        method:  "POST",
+        headers: { "Content-Type": "application/x-www-form-urlencoded", Accept: "application/json" },
+        body: new URLSearchParams({
+          grant_type:    grant_type   || "authorization_code",
+          code:          code         || "",
+          redirect_uri:  redirect_uri || "",
+          client_id:     phpClientId,
+          client_secret: phpClientSecret,
+        }).toString(),
+      });
+      const tokenText = await phpResp.text();
+      console.error(`[OAuth] /token PHP response (${phpResp.status}): ${tokenText.slice(0, 300)}`);
+      res.writeHead(phpResp.status, { "Content-Type": "application/json" });
+      res.end(tokenText);
+    } catch (err) {
+      console.error(`[OAuth] /token PHP request failed: ${err.message}`);
+      res.writeHead(502, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "server_error", error_description: "Token endpoint temporarily unavailable" }));
+    }
     return;
   }
 
