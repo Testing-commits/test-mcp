@@ -208,8 +208,25 @@ function createMcpServer(authContext = null) {
     description: "MCP Server for HLS CRM APIs",
   });
 
-  // Helper to inject authContext into all hlsRequest calls
-  const authedHlsRequest = (params) => hlsRequest({ ...params, authContext });
+  // Helper to inject authContext into all hlsRequest calls.
+  // Also auto-fills org_id / organizationId from authContext if not supplied by Claude.
+  const orgId = authContext ? (authContext.orgId || "") : "";
+  const authedHlsRequest = (params) => {
+    // Merge org into query and body, but only if the key already exists with an empty/missing value
+    const q = params.query || {};
+    const b = params.body   || null;
+    const filledQuery = {
+      ...q,
+      ...(("org_id"         in q && !q.org_id)         ? { org_id:         orgId } : {}),
+      ...(("organizationId" in q && !q.organizationId) ? { organizationId: orgId } : {}),
+    };
+    const filledBody = b ? {
+      ...b,
+      ...(("org_id"         in b && !b.org_id)         ? { org_id:         orgId } : {}),
+      ...(("organizationId" in b && !b.organizationId) ? { organizationId: orgId } : {}),
+    } : b;
+    return hlsRequest({ ...params, query: filledQuery, body: filledBody, authContext });
+  };
 
   // ══════════════════════════════════════════════════════════════════════════
   // LEADS
@@ -219,7 +236,7 @@ function createMcpServer(authContext = null) {
     "get_leads_summary",
     "Get a summary of leads for an organization/visitor.",
     {
-      organizationId: z.string().describe("Organization ID"),
+      organizationId: z.string().optional().describe("Organization ID (auto-filled from your login session if omitted)"),
       visitorId:      z.string().optional().describe("Visitor / lead ID"),
     },
     async (params) => {
@@ -238,7 +255,7 @@ function createMcpServer(authContext = null) {
     "get_leads",
     "Retrieve leads with rich filtering (pagination, stage, tags, dates, deal size, etc.).",
     {
-      org_id:             z.string().describe("Organization ID"),
+      org_id:             z.string().optional().describe("Organization ID (auto-filled from your login session if omitted)"),
       page:               z.string().optional().default("1").describe("Page number"),
       page_size:          z.string().optional().default("50").describe("Results per page (max 50)"),
       lead_ids:           z.string().optional().describe("Comma-separated lead IDs"),
@@ -281,7 +298,7 @@ function createMcpServer(authContext = null) {
     "get_unattended_leads",
     "Get leads that have not been attended to within specified criteria.",
     {
-      organizationId:       z.string().describe("Organization ID"),
+      organizationId:       z.string().optional().describe("Organization ID (auto-filled from your login session if omitted)"),
       userId:               z.string().optional().describe("User ID"),
       roleId:               z.string().optional().describe("Role ID"),
       assigned_user_ids:    z.string().optional().describe("Comma-separated assigned user IDs"),
@@ -307,7 +324,7 @@ function createMcpServer(authContext = null) {
     "create_lead",
     "Create a new lead in HLS.",
     {
-      organizationId: z.string().describe("Organization ID"),
+      organizationId: z.string().optional().describe("Organization ID (auto-filled from your login session if omitted)"),
       visitorId:      z.string().optional().describe("Visitor ID (if pre-existing)"),
       listId:         z.number().describe("List ID to add the lead into"),
       firstName:      z.string().optional().describe("First name"),
@@ -367,7 +384,7 @@ function createMcpServer(authContext = null) {
     "Update a lead's profile information (name, email, phone, etc.).",
     {
       visitorId:      z.string().describe("Visitor / lead ID"),
-      organizationId: z.string().describe("Organization ID"),
+      organizationId: z.string().optional().describe("Organization ID (auto-filled from your login session if omitted)"),
       firstName:      z.string().optional().describe("First name"),
       lastName:       z.string().optional().describe("Last name"),
       email:          z.string().optional().describe("Email address"),
@@ -390,7 +407,7 @@ function createMcpServer(authContext = null) {
     "Update qualifiers (stage, potential, tags, product/customer groups) for a lead.",
     {
       visitorId:       z.string().describe("Visitor / lead ID"),
-      organizationId:  z.string().describe("Organization ID"),
+      organizationId:  z.string().optional().describe("Organization ID (auto-filled from your login session if omitted)"),
       stageId:         z.number().optional().describe("Lead stage ID"),
       potential:       z.string().optional().describe("High, Medium, or Low"),
       tagIds:          z.array(z.number()).optional().describe("Array of tag IDs"),
@@ -412,7 +429,7 @@ function createMcpServer(authContext = null) {
     "Update the follow-up date/time for a lead.",
     {
       visitorId:      z.string().describe("Visitor / lead ID"),
-      organizationId: z.string().describe("Organization ID"),
+      organizationId: z.string().optional().describe("Organization ID (auto-filled from your login session if omitted)"),
       followupDate:   z.string().describe("Follow-up datetime ISO8601 or YYYY-MM-DD HH:mm:ss"),
       followupNote:   z.string().optional().describe("Note for the follow-up"),
     },
@@ -431,7 +448,7 @@ function createMcpServer(authContext = null) {
     "Update extended lead information (Info Plus custom fields).",
     {
       visitorId:      z.string().describe("Visitor / lead ID"),
-      organizationId: z.string().describe("Organization ID"),
+      organizationId: z.string().optional().describe("Organization ID (auto-filled from your login session if omitted)"),
       fields:         z.record(z.unknown()).describe("Key-value map of Info Plus fields to update"),
     },
     async ({ visitorId, organizationId, fields }) => {
@@ -451,7 +468,7 @@ function createMcpServer(authContext = null) {
   server.tool(
     "get_org",
     "Get organization details.",
-    { organizationId: z.string().describe("Organization ID") },
+    { organizationId: z.string().optional().describe("Organization ID (auto-filled from your login session if omitted)") },
     async ({ organizationId }) => {
       const data = await authedHlsRequest({
         method: "GET",
@@ -465,7 +482,7 @@ function createMcpServer(authContext = null) {
   server.tool(
     "get_product_groups",
     "List all product groups for an organization.",
-    { organizationId: z.string().describe("Organization ID") },
+    { organizationId: z.string().optional().describe("Organization ID (auto-filled from your login session if omitted)") },
     async ({ organizationId }) => {
       const data = await authedHlsRequest({
         method: "GET",
@@ -479,7 +496,7 @@ function createMcpServer(authContext = null) {
   server.tool(
     "get_customer_groups",
     "List all customer groups for an organization.",
-    { organizationId: z.string().describe("Organization ID") },
+    { organizationId: z.string().optional().describe("Organization ID (auto-filled from your login session if omitted)") },
     async ({ organizationId }) => {
       const data = await authedHlsRequest({
         method: "GET",
@@ -493,7 +510,7 @@ function createMcpServer(authContext = null) {
   server.tool(
     "get_tags",
     "List all tags for an organization.",
-    { organizationId: z.string().describe("Organization ID") },
+    { organizationId: z.string().optional().describe("Organization ID (auto-filled from your login session if omitted)") },
     async ({ organizationId }) => {
       const data = await authedHlsRequest({
         method: "GET",
@@ -507,7 +524,7 @@ function createMcpServer(authContext = null) {
   server.tool(
     "get_custom_fields",
     "List all custom fields defined for an organization.",
-    { organizationId: z.string().describe("Organization ID") },
+    { organizationId: z.string().optional().describe("Organization ID (auto-filled from your login session if omitted)") },
     async ({ organizationId }) => {
       const data = await authedHlsRequest({
         method: "GET",
@@ -521,7 +538,7 @@ function createMcpServer(authContext = null) {
   server.tool(
     "get_lead_stages",
     "List all lead stages for an organization.",
-    { organizationId: z.string().describe("Organization ID") },
+    { organizationId: z.string().optional().describe("Organization ID (auto-filled from your login session if omitted)") },
     async ({ organizationId }) => {
       const data = await authedHlsRequest({
         method: "GET",
@@ -540,7 +557,7 @@ function createMcpServer(authContext = null) {
     "bulk_update_lead_stage",
     "Bulk update lead stage for multiple leads.",
     {
-      organizationId: z.string().describe("Organization ID"),
+      organizationId: z.string().optional().describe("Organization ID (auto-filled from your login session if omitted)"),
       visitorIds:     z.string().describe("Comma-separated visitor IDs"),
       stageId:        z.number().describe("Target stage ID"),
     },
@@ -559,7 +576,7 @@ function createMcpServer(authContext = null) {
     "bulk_update_potential",
     "Bulk update potential for multiple leads.",
     {
-      organizationId: z.string().describe("Organization ID"),
+      organizationId: z.string().optional().describe("Organization ID (auto-filled from your login session if omitted)"),
       visitorIds:     z.string().describe("Comma-separated visitor IDs"),
       potential:      z.enum(["High", "Medium", "Low"]).describe("Potential value"),
     },
@@ -578,7 +595,7 @@ function createMcpServer(authContext = null) {
     "bulk_update_customer_group",
     "Bulk update customer group for multiple leads.",
     {
-      organizationId: z.string().describe("Organization ID"),
+      organizationId: z.string().optional().describe("Organization ID (auto-filled from your login session if omitted)"),
       visitorIds:     z.string().describe("Comma-separated visitor IDs"),
       categoryId:     z.number().describe("Customer group / category ID"),
     },
@@ -597,7 +614,7 @@ function createMcpServer(authContext = null) {
     "bulk_update_product_groups",
     "Bulk update product groups for multiple leads.",
     {
-      organizationId: z.string().describe("Organization ID"),
+      organizationId: z.string().optional().describe("Organization ID (auto-filled from your login session if omitted)"),
       visitorIds:     z.string().describe("Comma-separated visitor IDs"),
       services:       z.array(z.object({ id: z.string(), name: z.string() }))
                         .describe("Array of product group objects [{id, name}]"),
@@ -618,7 +635,7 @@ function createMcpServer(authContext = null) {
     "bulk_update_tags",
     "Bulk update tags for multiple leads.",
     {
-      organizationId: z.string().describe("Organization ID"),
+      organizationId: z.string().optional().describe("Organization ID (auto-filled from your login session if omitted)"),
       userId:         z.string().describe("User ID performing the update"),
       visitorIds:     z.string().describe("Comma-separated visitor IDs"),
       tags:           z.array(z.object({ id: z.number(), tag: z.string() }))
@@ -646,7 +663,7 @@ function createMcpServer(authContext = null) {
     "bulk_assign_leads",
     "Bulk assign multiple leads to a user.",
     {
-      organizationId: z.string().describe("Organization ID"),
+      organizationId: z.string().optional().describe("Organization ID (auto-filled from your login session if omitted)"),
       visitorIds:     z.string().describe("Comma-separated visitor IDs"),
       assignTo:       z.string().describe("User ID to assign leads to"),
       assignBy:       z.string().describe("User ID performing the assignment"),
@@ -681,7 +698,7 @@ function createMcpServer(authContext = null) {
     "get_todos",
     "Get todos/tasks for a lead.",
     {
-      organizationId: z.string().describe("Organization ID"),
+      organizationId: z.string().optional().describe("Organization ID (auto-filled from your login session if omitted)"),
       visitorId:      z.string().describe("Visitor / lead ID"),
     },
     async ({ organizationId, visitorId }) => {
@@ -698,7 +715,7 @@ function createMcpServer(authContext = null) {
     "create_todo",
     "Create a new todo/task for a lead.",
     {
-      organizationId: z.string().describe("Organization ID"),
+      organizationId: z.string().optional().describe("Organization ID (auto-filled from your login session if omitted)"),
       visitorId:      z.string().describe("Visitor / lead ID"),
       assignedTo:     z.number().describe("User ID to assign the todo to"),
       createdBy:      z.number().describe("User ID creating the todo"),
@@ -737,7 +754,7 @@ function createMcpServer(authContext = null) {
     "Update an existing todo/task.",
     {
       id:             z.number().describe("Todo ID"),
-      organizationId: z.string().describe("Organization ID"),
+      organizationId: z.string().optional().describe("Organization ID (auto-filled from your login session if omitted)"),
       assignedTo:     z.number().describe("User ID assigned to"),
       modifiedBy:     z.number().describe("User ID making the update"),
       dueDateTime:    z.string().optional().describe("New due date-time YYYY-MM-DD HH:mm:ss"),
@@ -768,7 +785,7 @@ function createMcpServer(authContext = null) {
     "get_users",
     "Get users in an organization.",
     {
-      org_id:  z.string().describe("Organization ID"),
+      org_id:  z.string().optional().describe("Organization ID (auto-filled from your login session if omitted)"),
       user_id: z.string().optional().describe("Specific user ID to fetch"),
     },
     async ({ org_id, user_id }) => {
@@ -785,7 +802,7 @@ function createMcpServer(authContext = null) {
     "create_user",
     "Create a new user in the organization.",
     {
-      org_id:      z.string().describe("Organization ID"),
+      org_id:      z.string().optional().describe("Organization ID (auto-filled from your login session if omitted)"),
       firstName:   z.string().describe("First name"),
       lastName:    z.string().optional().describe("Last name"),
       email:       z.string().describe("Email address"),
@@ -808,7 +825,7 @@ function createMcpServer(authContext = null) {
     "update_user",
     "Update an existing user's information.",
     {
-      org_id:      z.string().describe("Organization ID"),
+      org_id:      z.string().optional().describe("Organization ID (auto-filled from your login session if omitted)"),
       userId:      z.string().describe("User ID to update"),
       firstName:   z.string().optional().describe("First name"),
       lastName:    z.string().optional().describe("Last name"),
@@ -831,7 +848,7 @@ function createMcpServer(authContext = null) {
   // ══════════════════════════════════════════════════════════════════════════
 
   const reportSchema = {
-    organizationId:  z.string().describe("Organization ID"),
+    organizationId:  z.string().optional().describe("Organization ID (auto-filled from your login session if omitted)"),
     userIds:         z.array(z.string()).describe("Array of user ID strings"),
     currentStartDate:z.string().describe("Report start date YYYY-MM-DD HH:mm:ss"),
     currentEndDate:  z.string().describe("Report end date YYYY-MM-DD HH:mm:ss"),
