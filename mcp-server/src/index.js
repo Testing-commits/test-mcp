@@ -96,13 +96,15 @@ async function validateBearerToken(token) {
     }
 
     const session = {
-      userId:    data.userId,
-      sessionId: data.sessionId,   // actual HLS session token, not the OAuth token
-      orgId:     data.orgId,
-      emailId:   data.emailId,
-      userName:  data.userName,
-      orgName:   data.orgName,
-      expiry:    Date.now() + CACHE_TTL,
+      userId:      data.userId,
+      sessionId:   data.sessionId,   // actual HLS session token, not the OAuth token
+      orgId:       data.orgId,
+      emailId:     data.emailId,
+      userName:    data.userName,
+      orgName:     data.orgName,
+      oauthClient: data.oauth_client || null,
+      serverExpiry: data.expires_at  || null,  // server-side expiry from PHP
+      expiry:      Date.now() + CACHE_TTL,
     };
     console.error(`[Auth] Token validated: userId=${session.userId}, orgId=${session.orgId}`);
     tokenCache.set(token, session);
@@ -924,6 +926,9 @@ async function requestHandler(req, res) {
     "https://chatgpt.com",
     "https://chat.openai.com",
     "https://claude.ai",
+    "https://gemini.google.com",
+    "https://aistudio.google.com",
+    "https://makersuite.google.com",
   ];
   const origin = req.headers["origin"];
   if (allowedOrigins.includes(origin)) {
