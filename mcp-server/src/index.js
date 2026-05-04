@@ -20,13 +20,14 @@
  */
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
+import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { z } from "zod";
 import http from "http";
 import https from "https";
 import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
+import { randomUUID } from "node:crypto";
 import "dotenv/config";
 import crypto from "crypto";
 
@@ -999,10 +1000,11 @@ async function requestHandler(req, res) {
   if (allowedOrigins.includes(origin)) {
     res.setHeader("Access-Control-Allow-Origin", origin);
   }
-  res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+  res.setHeader("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, Mcp-Session-Id");
 
   if (req.method === "OPTIONS") {
+    res.setHeader("Access-Control-Max-Age", "86400");
     res.writeHead(204);
     res.end();
     return;
@@ -1012,8 +1014,8 @@ async function requestHandler(req, res) {
   if (req.method === "GET" && url.pathname === "/.well-known/oauth-protected-resource") {
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end(JSON.stringify({
-      resource: `${getRequestBaseUrl(req)}/mcp/sse`,             // ← actual SSE endpoint Claude connects to
-      authorization_servers: [`${getRequestBaseUrl(req)}`],      // ← discovery is on THIS Node.js server
+      resource: `${getRequestBaseUrl(req)}/mcp`,                  // ← Streamable HTTP endpoint
+      authorization_servers: [`${getRequestBaseUrl(req)}`],
       scopes_supported: ["leads", "todos", "org", "reports"],
     }));
     return;
@@ -1158,95 +1160,101 @@ async function requestHandler(req, res) {
     return;
   }
 
-  // ── Health check / manifest ── GET /mcp ───────────────────────────────────
-  if (req.method === "GET" && url.pathname === "/mcp") {
-    res.writeHead(200, { "Content-Type": "application/json" });
-    
-    const authConfig = OAUTH_ENABLED ? {
-      type: "oauth2",
-      oauth2: {
-        authorizationUrl: `${BASE_URL}/api/mcp/v1/oauth/authorize`,
-        tokenUrl: `${BASE_URL}/api/mcp/v1/oauth/token`,
-        scope: "leads todos org reports",
-      }
-    } : { type: "none" };
-    
-    res.end(JSON.stringify({
-      name:        "HLS CRM",
-      version:     "1.0.0",
-      description: "MCP server for HLS CRM — manage leads, todos, users and reports",
-      auth:        authConfig,
-    }));
-    return;
-  }
+  // ── Unified MCP endpoint ── POST|GET|DELETE /mcp ─────────────────────────
+  // Implements MCP Streamable HTTP transport (spec 2025-03-26).
+  // POST  /mcp  — initialize or send messages (streams SSE response back inline)
+  // GET   /mcp  — open long-lived SSE stream for server-initiated messages (or health if no session)
+  // DELETE /mcp — terminate session cleanly
+  if (url.pathname === "/mcp") {
+    const sessionId = req.headers["mcp-session-id"];
 
-  // ── SSE endpoint ── GET /mcp/sse ──────────────────────────────────────────
-  if (req.method === "GET" && url.pathname === "/mcp/sse") {
-    console.error(`[SSE] New session from ${origin || "unknown"}`);
+    // ── Health check: GET /mcp with no session ID ─────────────────────────
+    if (req.method === "GET" && !sessionId) {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({
+        name:        "HLS CRM",
+        version:     "1.0.0",
+        description: "MCP server for HLS CRM — manage leads, todos, users and reports",
+        protocol:    "MCP Streamable HTTP 2025-03-26",
+      }));
+      return;
+    }
 
-    const token = extractToken(req);
-    let authContext = null;
-
-    if (token) {
-      authContext = await validateBearerToken(token);
-      if (!authContext) {
-        const resourceMetadata = getResourceMetadataUrl(req);
-        console.error(`[SSE] Invalid Bearer token`);
-        res.setHeader("WWW-Authenticate", `Bearer realm="mcp", resource_metadata="${resourceMetadata}"`);
-        res.writeHead(401, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ error: "Invalid token" }));
+    // ── Route to existing session ─────────────────────────────────────────
+    if (sessionId) {
+      const session = sessions.get(sessionId);
+      if (!session) {
+        console.error(`[MCP] Unknown session: ${sessionId}`);
+        res.writeHead(404, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "Session not found" }));
         return;
       }
-      console.error(`[SSE] Authenticated session for user: ${authContext.userId}`);
-    } else if (!OAUTH_ENABLED && AUTH_TOKEN && USER_ID) {
-      authContext = { userId: USER_ID, sessionId: AUTH_TOKEN };
-      console.error(`[SSE] Fallback session using env credentials userId=${USER_ID}`);
-    } else {
-      const resourceMetadata = getResourceMetadataUrl(req);
-      console.error(`[SSE] Missing Bearer token`);
-      res.setHeader("WWW-Authenticate", `Bearer realm="mcp", resource_metadata="${resourceMetadata}"`);
-      res.writeHead(401, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ error: "Missing Bearer token" }));
+
+      // Rate-limit per session on message POSTs
+      if (req.method === "POST") {
+        try { checkRateLimit(sessionId); }
+        catch {
+          res.writeHead(429, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "rate_limit_exceeded" }));
+          return;
+        }
+      }
+
+      await session.transport.handleRequest(req, res);
       return;
     }
 
-    const mcpServer = createMcpServer(authContext);
-    const transport = new SSEServerTransport("/mcp/messages", res);
+    // ── New session initialization: POST /mcp with no session ID ─────────
+    if (req.method === "POST") {
+      console.error(`[MCP] New session init from ${origin || "unknown"}`);
 
-    sessions.set(transport.sessionId, { transport, authContext });
-    console.error(`[SSE] Session started: ${transport.sessionId}`);
+      const token = extractToken(req);
+      let authContext = null;
 
-    res.on("close", () => {
-      sessions.delete(transport.sessionId);
-      console.error(`[SSE] Session closed: ${transport.sessionId}`);
-    });
+      if (token) {
+        authContext = await validateBearerToken(token);
+        if (!authContext) {
+          const resourceMetadata = getResourceMetadataUrl(req);
+          console.error(`[MCP] Invalid Bearer token`);
+          res.setHeader("WWW-Authenticate", `Bearer realm="mcp", resource_metadata="${resourceMetadata}"`);
+          res.writeHead(401, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "Invalid token" }));
+          return;
+        }
+        console.error(`[MCP] Authenticated session for user: ${authContext.userId}`);
+      } else if (!OAUTH_ENABLED && AUTH_TOKEN && USER_ID) {
+        authContext = { userId: USER_ID, sessionId: AUTH_TOKEN };
+        console.error(`[MCP] Fallback env-credentials session userId=${USER_ID}`);
+      } else {
+        const resourceMetadata = getResourceMetadataUrl(req);
+        console.error(`[MCP] Missing Bearer token`);
+        res.setHeader("WWW-Authenticate", `Bearer realm="mcp", resource_metadata="${resourceMetadata}"`);
+        res.writeHead(401, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "Missing Bearer token" }));
+        return;
+      }
 
-    await mcpServer.connect(transport);
-    return;
-  }
+      const transport = new StreamableHTTPServerTransport({
+        sessionIdGenerator: () => randomUUID(),
+        onsessioninitialized: (newSessionId) => {
+          sessions.set(newSessionId, { transport, authContext });
+          console.error(`[MCP] Session created: ${newSessionId} userId=${authContext.userId}`);
+        },
+        onsessionclosed: (closedSessionId) => {
+          sessions.delete(closedSessionId);
+          console.error(`[MCP] Session closed: ${closedSessionId}`);
+        },
+      });
 
-  // ── Message endpoint ── POST /mcp/messages ────────────────────────────────
-  if (req.method === "POST" && url.pathname === "/mcp/messages") {
-    const sessionId = url.searchParams.get("sessionId") || req.headers["mcp-session-id"];
-    const session = sessions.get(sessionId);
-
-    if (!session) {
-      console.error(`[MCP] Message POST failed; sessionId=${sessionId || "none"} not found`);
-      res.writeHead(404, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ error: "Session not found" }));
+      const mcpServer = createMcpServer(authContext);
+      await mcpServer.connect(transport);
+      await transport.handleRequest(req, res);
       return;
     }
 
-    try {
-      checkRateLimit(sessionId);
-    } catch (err) {
-      console.error(`[MCP] Rate limit exceeded for sessionId=${sessionId}`);
-      res.writeHead(429, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ error: "rate_limit_exceeded" }));
-      return;
-    }
-
-    await session.transport.handlePostMessage(req, res);
+    // Method not allowed on /mcp with no session
+    res.writeHead(405, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ error: "Method Not Allowed" }));
     return;
   }
 
@@ -1277,9 +1285,8 @@ const actualProtocol = useHttpsServer ? "https" : "http";
 
 server.listen(PORT, () => {
   console.error(`HLS MCP Server running on port ${PORT}`);
-  console.error(`SSE:      ${actualProtocol}://localhost:${PORT}/mcp/sse`);
-  console.error(`Messages: ${actualProtocol}://localhost:${PORT}/mcp/messages`);
-  console.error(`Health:   ${actualProtocol}://localhost:${PORT}/mcp`);
-  console.error(`Auth:     Xemail=${USER_ID ? "set" : "MISSING"} Auth=${AUTH_TOKEN ? "set" : "MISSING"}`);
+  console.error(`MCP:    ${actualProtocol}://localhost:${PORT}/mcp  (Streamable HTTP 2025-03-26)`);
+  console.error(`Health: ${actualProtocol}://localhost:${PORT}/mcp  (GET, no session)`);
+  console.error(`Auth:   Xemail=${USER_ID ? "set" : "MISSING"} Auth=${AUTH_TOKEN ? "set" : "MISSING"}`);
 });
 
